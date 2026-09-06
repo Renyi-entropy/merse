@@ -48,20 +48,23 @@ COMPROMISED.
 
 ## Validated against
 
-Adversarial test, 2026-09-06: injected two real impairments on a live
-WireGuard tunnel via `tc netem`, ran both checks.
+Adversarial test, 2026-09-06, on a live WireGuard tunnel via `tc
+netem` — full writeup with real numbers in `CASE_STUDY.md`, including
+a correction found on a later audit.
 
-- **Random jitter injected** (variable delay): REGIME check caught it
-  clean — state means shifted 9x/2.3x above baseline.
+- **Random jitter injected** (variable delay): both checks caught it
+  hard (LATENCY z=199.5, REGIME z=9.1).
 - **Fixed 25ms delay injected** (deterministic relay/inserted hop):
-  invisible to a jitter-based REGIME check by construction — a
-  uniform delay doesn't change inter-sample spacing. Caught instead by
-  the LATENCY check run against an RTT series (z=76.4, matching the
-  injected delay almost exactly).
+  REGIME check is structurally blind to this (a uniform delay doesn't
+  change inter-sample spacing) — but LATENCY check, run against the
+  same jitter series, still caught it (z=22.6) once measured against a
+  correctly matched baseline. An RTT series gives an even cleaner
+  signal (z=76.4, near-exact match to the injected delay).
 
-**Operational conclusion: run both checks, and run them against both a
-jitter series and an RTT series per monitored link.** Neither single
-check/series combination covers both tampering signatures.
+**Operational conclusion: REGIME and LATENCY are sensitive to
+orthogonal tampering signatures, and RTT is a cleaner LATENCY signal
+than jitter-mean when available. Run all three where possible, and
+always baseline from the same vantage point you'll be checking from.**
 
 ## Known limitations / out of scope
 
