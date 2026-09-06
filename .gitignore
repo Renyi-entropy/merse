@@ -1,2 +1,5 @@
 merse
+merse-*
 *.merse
+*.png
+*_rtt.txt
