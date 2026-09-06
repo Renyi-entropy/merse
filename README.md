@@ -18,6 +18,13 @@ tool's.
 gcc -O3 -Wall -o merse merse.c -lm
 ```
 
+## Example
+
+Real output, a tampered sample checked against a clean baseline
+(sample/baseline names genericized, no identifying data):
+
+![merse check example output](merse_cli_screenshot.png)
+
 ## Usage
 
 ```

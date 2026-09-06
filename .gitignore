@@ -2,4 +2,5 @@ merse
 merse-*
 *.merse
 *.png
+!merse_cli_screenshot.png
 *_rtt.txt
