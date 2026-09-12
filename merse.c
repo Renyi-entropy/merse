@@ -225,21 +225,51 @@ static void save_baseline(const char *path, const Baseline *b) {
     fclose(f);
 }
 
+/* Every field below must actually be present in the file -- a
+ * Baseline missing just one (e.g. "mean" dropped by a corrupted or
+ * interrupted write, while "std"/state fields stay legitimately
+ * nonzero) would otherwise silently keep the zero-initialized default
+ * and pass the MIN_BASELINE_SD variance-floor check further down,
+ * which only screens std/state_sd, not mean. That's the same
+ * fail-open class of bug already fixed for the z=0 default and the
+ * silently-truncated values-file read -- close it here too by
+ * requiring every key to be seen at least once. */
+static const char *const REQUIRED_BASELINE_KEYS[] = {
+    "n", "mean", "std", "state0_mu", "state0_sd", "state1_mu", "state1_sd"
+};
+#define N_REQUIRED_BASELINE_KEYS (sizeof(REQUIRED_BASELINE_KEYS)/sizeof(REQUIRED_BASELINE_KEYS[0]))
+
 static Baseline load_baseline(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) { fprintf(stderr, "merse: cannot open baseline %s\n", path); exit(1); }
     Baseline b = {0};
+    int seen[N_REQUIRED_BASELINE_KEYS] = {0};
     char key[64]; double val;
     while (fscanf(f, "%63s %lf", key, &val) == 2) {
-        if (!strcmp(key,"n")) b.n=(long)val;
-        else if (!strcmp(key,"mean")) b.mean=val;
-        else if (!strcmp(key,"std")) b.std=val;
-        else if (!strcmp(key,"state0_mu")) b.state_mu[0]=val;
-        else if (!strcmp(key,"state0_sd")) b.state_sd[0]=val;
-        else if (!strcmp(key,"state1_mu")) b.state_mu[1]=val;
-        else if (!strcmp(key,"state1_sd")) b.state_sd[1]=val;
+        if (!strcmp(key,"n")) { b.n=(long)val; seen[0]=1; }
+        else if (!strcmp(key,"mean")) { b.mean=val; seen[1]=1; }
+        else if (!strcmp(key,"std")) { b.std=val; seen[2]=1; }
+        else if (!strcmp(key,"state0_mu")) { b.state_mu[0]=val; seen[3]=1; }
+        else if (!strcmp(key,"state0_sd")) { b.state_sd[0]=val; seen[4]=1; }
+        else if (!strcmp(key,"state1_mu")) { b.state_mu[1]=val; seen[5]=1; }
+        else if (!strcmp(key,"state1_sd")) { b.state_sd[1]=val; seen[6]=1; }
     }
     fclose(f);
+
+    int n_missing = 0;
+    for (size_t i = 0; i < N_REQUIRED_BASELINE_KEYS; i++) {
+        if (!seen[i]) {
+            fprintf(stderr, "merse: baseline %s is missing required field '%s'\n",
+                    path, REQUIRED_BASELINE_KEYS[i]);
+            n_missing++;
+        }
+    }
+    if (n_missing > 0) {
+        fprintf(stderr, "merse: refusing a corrupted/incomplete baseline (%d field%s missing) --\n"
+                        "       re-run 'merse baseline' to regenerate it\n",
+                n_missing, n_missing == 1 ? "" : "s");
+        exit(1);
+    }
     return b;
 }
 
