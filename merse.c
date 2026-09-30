@@ -63,7 +63,7 @@ static void seed_rng(uint64_t seed) {
 
 static double *read_values(const char *path, long *n_out) {
     FILE *f = fopen(path, "r");
-    if (!f) { fprintf(stderr, "merse: cannot open %s\n", path); exit(1); }
+    if (!f) { fprintf(stderr, "merse: cannot open %s\n", path); exit(3); }
     long cap = 1024, n = 0;
     double *v = malloc(cap * sizeof(double));
     double x;
@@ -80,10 +80,10 @@ static double *read_values(const char *path, long *n_out) {
      * file wasn't a number and the rest was dropped. */
     if (!feof(f)) {
         fprintf(stderr, "merse: %s contains non-numeric content after %ld values -- refusing a silently truncated read\n", path, n);
-        fclose(f); exit(1);
+        fclose(f); exit(3);
     }
     fclose(f);
-    if (n < 10) { fprintf(stderr, "merse: need at least 10 values, got %ld\n", n); exit(1); }
+    if (n < 10) { fprintf(stderr, "merse: need at least 10 values, got %ld\n", n); exit(3); }
     if (n < MIN_RELIABLE_SAMPLES)
         fprintf(stderr, "merse: WARNING -- only %ld samples (< %d); HMM regime fit is likely underpowered/overfit at this size, treat REGIME check with suspicion\n", n, MIN_RELIABLE_SAMPLES);
     *n_out = n;
@@ -214,7 +214,7 @@ typedef struct {
 
 static void save_baseline(const char *path, const Baseline *b) {
     FILE *f = fopen(path, "w");
-    if (!f) { fprintf(stderr, "merse: cannot write %s\n", path); exit(1); }
+    if (!f) { fprintf(stderr, "merse: cannot write %s\n", path); exit(3); }
     fprintf(f, "n %ld\n", b->n);
     fprintf(f, "mean %.10g\n", b->mean);
     fprintf(f, "std %.10g\n", b->std);
@@ -241,7 +241,7 @@ static const char *const REQUIRED_BASELINE_KEYS[] = {
 
 static Baseline load_baseline(const char *path) {
     FILE *f = fopen(path, "r");
-    if (!f) { fprintf(stderr, "merse: cannot open baseline %s\n", path); exit(1); }
+    if (!f) { fprintf(stderr, "merse: cannot open baseline %s\n", path); exit(3); }
     Baseline b = {0};
     int seen[N_REQUIRED_BASELINE_KEYS] = {0};
     char key[64]; double val;
@@ -268,7 +268,7 @@ static Baseline load_baseline(const char *path) {
         fprintf(stderr, "merse: refusing a corrupted/incomplete baseline (%d field%s missing) --\n"
                         "       re-run 'merse baseline' to regenerate it\n",
                 n_missing, n_missing == 1 ? "" : "s");
-        exit(1);
+        exit(3);
     }
     return b;
 }
@@ -282,11 +282,58 @@ static Baseline load_baseline(const char *path) {
  * deviation score identically to "no deviation at all." */
 #define MIN_BASELINE_SD 1e-9
 
-static const char *verdict_label(double z) {
+enum { V_CLEAN = 0, V_SUSPECT = 1, V_COMPROMISED = 2 };
+
+static int verdict_severity(double z) {
     double az = fabs(z);
-    if (az < 2.0) return "CLEAN";
-    if (az < 5.0) return "SUSPECT";
-    return "COMPROMISED";
+    if (az < 2.0) return V_CLEAN;
+    if (az < 5.0) return V_SUSPECT;
+    return V_COMPROMISED;
+}
+
+static const char *severity_label(int sev) {
+    switch (sev) {
+        case V_CLEAN: return "CLEAN";
+        case V_SUSPECT: return "SUSPECT";
+        default: return "COMPROMISED";
+    }
+}
+
+/* One independent z-test against the baseline. valid=0 means the
+ * baseline std for this test is below MIN_BASELINE_SD, so no z-score
+ * can be trusted; z is then NAN and must not be read. */
+typedef struct { const char *name; int valid; double z; } Check;
+
+/* z = (observed - expected) / (baseline_sd / sqrt(n)): the standard
+ * error of a mean over n samples, n=1 for a single estimate. */
+static Check make_check(const char *name, double observed, double expected, double baseline_sd, long n) {
+    int valid = baseline_sd > MIN_BASELINE_SD;
+    return (Check){ name, valid, valid ? (observed - expected) / (baseline_sd / sqrt((double)n)) : NAN };
+}
+
+/* fail closed: an indeterminate check can never resolve to CLEAN --
+ * it scores SUSPECT, so the overall max is at least SUSPECT. Each check
+ * is scored on its own, so a valid check's evidence is never dropped
+ * because a sibling check is indeterminate. */
+static int check_severity(const Check *c) {
+    return c->valid ? verdict_severity(c->z) : V_SUSPECT;
+}
+
+/* Does a outrank b as the reported trigger? Higher severity first;
+ * on a tie, an indeterminate check is surfaced over a valid one;
+ * between two valid checks, the larger |z|. */
+static int outranks(const Check *a, const Check *b) {
+    int sa = check_severity(a), sb = check_severity(b);
+    if (sa != sb) return sa > sb;
+    if (a->valid != b->valid) return !a->valid;
+    return a->valid && fabs(a->z) > fabs(b->z);
+}
+
+static const Check *worst_check(const Check *checks, int n) {
+    const Check *w = &checks[0];
+    for (int i = 1; i < n; i++)
+        if (outranks(&checks[i], w)) w = &checks[i];
+    return w;
 }
 
 static void cmd_baseline(const char *values_path, const char *out_path) {
@@ -312,60 +359,63 @@ static void cmd_baseline(const char *values_path, const char *out_path) {
     free(x);
 }
 
-static void cmd_check(const char *values_path, const char *baseline_path) {
+/* Exit code contract for `merse check`, so a caller can branch on $?
+ * instead of parsing stdout text (previously cmd_check was void and
+ * main always returned 0 regardless of verdict -- no way to script
+ * against this without a fragile regex on the printed report):
+ *   0 = CLEAN
+ *   1 = SUSPECT (includes "SUSPECT (indeterminate)")
+ *   2 = COMPROMISED
+ *   3 = usage/runtime error (bad args, unreadable file, corrupt baseline)
+ */
+static int cmd_check(const char *values_path, const char *baseline_path) {
     long n; double *x = read_values(values_path, &n);
     seed_rng(0xC0FFEE);
     Baseline b = load_baseline(baseline_path);
 
-    /* LATENCY check: sample mean vs baseline mean, SE from baseline std */
+    /* LATENCY check: sample mean vs baseline mean, SE from baseline std.
+     * REGIME check: fresh HMM state means vs baseline state means,
+     * scaled by baseline state std -- one Check per state. */
     double mean, std; mean_std(x, n, &mean, &std);
-    int latency_valid = (b.std > MIN_BASELINE_SD);
-    double se = b.std / sqrt((double)n);
-    double z_latency = latency_valid ? (mean - b.mean) / se : 0.0;
-
-    /* REGIME check: fresh HMM state means vs baseline state means,
-     * scaled by baseline state std */
     HMM2 h = fit_hmm2_best(x, n);
-    int state0_valid = (b.state_sd[0] > MIN_BASELINE_SD);
-    int state1_valid = (b.state_sd[1] > MIN_BASELINE_SD);
-    double z_state0 = state0_valid ? (h.mu[0] - b.state_mu[0]) / b.state_sd[0] : 0.0;
-    double z_state1 = state1_valid ? (h.mu[1] - b.state_mu[1]) / b.state_sd[1] : 0.0;
-    int regime_valid = state0_valid && state1_valid;
-    double z_regime = fabs(z_state0) > fabs(z_state1) ? z_state0 : z_state1;
+    Check checks[] = {
+        make_check("LATENCY",      mean,    b.mean,        b.std,         n),
+        make_check("REGIME(low)",  h.mu[0], b.state_mu[0], b.state_sd[0], 1),
+        make_check("REGIME(high)", h.mu[1], b.state_mu[1], b.state_sd[1], 1),
+    };
+    const Check *latency = &checks[0], *low = &checks[1], *high = &checks[2];
 
     printf("=== merse check: %s vs baseline %s ===\n", values_path, baseline_path);
     printf("\n[LATENCY check] mean-shift vs baseline\n");
     printf("  baseline mean=%.6f std=%.6f (n=%ld)\n", b.mean, b.std, b.n);
     printf("  sample   mean=%.6f (n=%ld)\n", mean, n);
-    if (latency_valid)
-        printf("  z=%.2f -> %s\n", z_latency, verdict_label(z_latency));
+    if (latency->valid)
+        printf("  z=%.2f -> %s\n", latency->z, severity_label(check_severity(latency)));
     else
         printf("  INDETERMINATE -- baseline std (%.2e) too small to trust a z-score; re-capture a longer/more representative baseline\n", b.std);
 
     printf("\n[REGIME check] state-mean shift vs baseline\n");
     printf("  baseline states: low=%.6f(+-%.6f)  high=%.6f(+-%.6f)\n", b.state_mu[0], b.state_sd[0], b.state_mu[1], b.state_sd[1]);
     printf("  sample   states: low=%.6f            high=%.6f\n", h.mu[0], h.mu[1]);
-    if (regime_valid)
-        printf("  z(low)=%.2f  z(high)=%.2f -> worst z=%.2f -> %s\n", z_state0, z_state1, z_regime, verdict_label(z_regime));
-    else
-        printf("  INDETERMINATE -- baseline state std too small to trust a z-score; re-capture a longer/more representative baseline\n");
-
-    /* fail closed: an indeterminate check can never resolve to CLEAN --
-     * it forces at least SUSPECT rather than silently passing */
-    const char *final_verdict;
-    const char *trigger = "";
-    if (!latency_valid || !regime_valid) {
-        int both_clean_if_valid = (!latency_valid || fabs(z_latency) < 2.0) && (!regime_valid || fabs(z_regime) < 2.0);
-        final_verdict = both_clean_if_valid ? "SUSPECT (indeterminate)" : verdict_label(fabs(z_latency) > fabs(z_regime) ? z_latency : z_regime);
-        trigger = !latency_valid && !regime_valid ? "BOTH checks indeterminate" : (!latency_valid ? "LATENCY indeterminate" : "REGIME indeterminate");
+    if (low->valid && high->valid) {
+        const Check *w = worst_check(low, 2);
+        printf("  z(low)=%.2f  z(high)=%.2f -> worst z=%.2f -> %s\n", low->z, high->z, w->z, severity_label(check_severity(w)));
     } else {
-        double worst = fabs(z_latency) > fabs(z_regime) ? z_latency : z_regime;
-        final_verdict = verdict_label(worst);
-        trigger = fabs(z_latency) > fabs(z_regime) ? "LATENCY" : "REGIME";
+        for (const Check *c = low; c <= high; c++) {
+            if (c->valid)
+                printf("  %s z=%.2f -> %s\n", c->name, c->z, severity_label(check_severity(c)));
+            else
+                printf("  %s INDETERMINATE -- baseline state std too small to trust a z-score; re-capture a longer/more representative baseline\n", c->name);
+        }
     }
-    printf("\n=== OVERALL VERDICT: %s ===\n", final_verdict);
-    printf("(%s)\n", trigger);
+
+    const Check *trigger = worst_check(checks, 3);
+    int sev = check_severity(trigger);
+    printf("\n=== OVERALL VERDICT: %s%s ===\n", severity_label(sev), trigger->valid ? "" : " (indeterminate)");
+    printf("(%s%s)\n", trigger->name, trigger->valid ? "" : " indeterminate");
     free(x);
+
+    return sev;
 }
 
 int main(int argc, char **argv) {
@@ -374,17 +424,18 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage:\n");
         fprintf(stderr, "  merse baseline <values_file> <baseline_out_file>\n");
         fprintf(stderr, "  merse check    <values_file> <baseline_file>\n");
-        return 1;
+        fprintf(stderr, "\nexit codes for `check`: 0=CLEAN 1=SUSPECT 2=COMPROMISED 3=usage/runtime error\n");
+        return 3;
     }
     if (!strcmp(argv[1], "baseline")) {
-        if (argc != 4) { fprintf(stderr, "usage: merse baseline <values_file> <baseline_out_file>\n"); return 1; }
+        if (argc != 4) { fprintf(stderr, "usage: merse baseline <values_file> <baseline_out_file>\n"); return 3; }
         cmd_baseline(argv[2], argv[3]);
+        return 0;
     } else if (!strcmp(argv[1], "check")) {
-        if (argc != 4) { fprintf(stderr, "usage: merse check <values_file> <baseline_file>\n"); return 1; }
-        cmd_check(argv[2], argv[3]);
+        if (argc != 4) { fprintf(stderr, "usage: merse check <values_file> <baseline_file>\n"); return 3; }
+        return cmd_check(argv[2], argv[3]);
     } else {
         fprintf(stderr, "merse: unknown command '%s'\n", argv[1]);
-        return 1;
+        return 3;
     }
-    return 0;
 }
